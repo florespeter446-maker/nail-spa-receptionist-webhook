@@ -180,16 +180,19 @@ def login_smartscheduling(page):
     3. Do the same for the password field and the submit/login button.
     4. Replace the placeholder selectors below with the real ones.
     """
-    page.goto(SMARTSCHEDULING_LOGIN_URL)
+    page.goto(SMARTSCHEDULING_LOGIN_URL, wait_until="networkidle")
+    page.wait_for_selector('#UserName', timeout=15000)
     page.fill('#UserName', SMARTSCHEDULING_EMAIL)
     page.fill('#Password', SMARTSCHEDULING_PASSWORD)
+    page.wait_for_timeout(300)
     page.get_by_role("button", name=re.compile("sign ?in", re.I)).click()
     page.wait_for_load_state("networkidle")
     print(f"[smartscheduling] after login, landed on: {page.url}")
 
     if "/login" in page.url:
         # Login didn't take -- surface whatever error SmartScheduling is showing so we can
-        # tell a wrong-password problem apart from a form/selector problem.
+        # tell a wrong-password problem apart from a bot-detection/WAF block (Render's
+        # outbound IP is a datacenter IP, which some sites silently reject).
         error_text = ""
         for sel in [".validation-summary-errors", ".field-validation-error", ".alert", "[class*='error']"]:
             loc = page.locator(sel)
@@ -197,9 +200,15 @@ def login_smartscheduling(page):
                 error_text = " | ".join(loc.all_inner_texts())
                 if error_text.strip():
                     break
+        body_text = ""
+        try:
+            body_text = page.locator("body").inner_text()[:500]
+        except Exception:
+            pass
         raise RuntimeError(
             f"SmartScheduling login failed -- still on {page.url}. "
-            f"Page error text: {error_text!r}. Check SMARTSCHEDULING_EMAIL/PASSWORD env vars on Render."
+            f"Page error text: {error_text!r}. Body snippet: {body_text!r}. "
+            f"Check SMARTSCHEDULING_EMAIL/PASSWORD env vars on Render."
         )
 
 
