@@ -187,6 +187,21 @@ def login_smartscheduling(page):
     page.wait_for_load_state("networkidle")
     print(f"[smartscheduling] after login, landed on: {page.url}")
 
+    if "/login" in page.url:
+        # Login didn't take -- surface whatever error SmartScheduling is showing so we can
+        # tell a wrong-password problem apart from a form/selector problem.
+        error_text = ""
+        for sel in [".validation-summary-errors", ".field-validation-error", ".alert", "[class*='error']"]:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                error_text = " | ".join(loc.all_inner_texts())
+                if error_text.strip():
+                    break
+        raise RuntimeError(
+            f"SmartScheduling login failed -- still on {page.url}. "
+            f"Page error text: {error_text!r}. Check SMARTSCHEDULING_EMAIL/PASSWORD env vars on Render."
+        )
+
 
 def goto_smartscheduling_date(page, target):
     """
