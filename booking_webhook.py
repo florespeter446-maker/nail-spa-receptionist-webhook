@@ -6,13 +6,16 @@ Exposes three endpoints that a Retell custom function calls during a live phone 
   POST /book_appointment
   POST /take_message
 
-check_availability and book_appointment drive two real Chromium browser sessions (via
-Playwright): one against go-booking.gocheckin.net (the real booking system customers are
-scheduled into) and, after a successful GoCheckIn booking, a second one against
-smartscheduling.com/calendar to mirror the same appointment there. Neither platform has a
-public API, so both are automated by clicking through the same screens a staff member would
-use. take_message just sends a notification (fill in your own SMS/email provider) -- no
-browser automation needed there.
+Call flow that matches how David actually runs the salon:
+  1. check_availability  -> reads SmartScheduling's calendar (David's source of truth for
+     what's already on the books) to see what's open on the requested date.
+  2. book_appointment     -> books the real appointment on GoCheckIn, keyed off the caller's
+     phone number, then writes the same appointment onto SmartScheduling's calendar so David
+     can see it too.
+  3. take_message         -> logs a note for staff follow-up (cancellations, complaints, etc).
+
+Neither GoCheckIn nor SmartScheduling has a public API, so both are automated with a real
+Chromium browser (via Playwright) clicking through the same screens a staff member would use.
 
 --------------------------------------------------------------------------------------
 SETUP
@@ -266,6 +269,62 @@ def mirror_on_smartscheduling(data):
             browser.close()
 
 
+BUSINESS_HOURS = {
+    # weekday() -> (open_hour, close_hour), 24h clock. Monday=0 ... Sunday=6.
+    1: (10, 19), 2: (10, 19), 3: (10, 19), 4: (10, 19), 5: (10, 19),  # Tue-Sat
+    6: (10, 17),  # Sunday
+    # Monday (0) is closed -- left out on purpose.
+}
+
+
+def read_smartscheduling_availability(page, date_str):
+    """
+    Navigate SmartScheduling's calendar to the requested date and read back which slots
+    are already booked, so we can offer only genuinely open times.
+
+    TODO: verify the calendar's real date-navigation control and the DOM structure of
+    appointment blocks (never captured against a logged-out/empty day) -- adjust the
+    selectors below after watching one real check_availability call in the Render logs.
+    """
+    page.goto(SMARTSCHEDULING_URL)
+    page.wait_for_load_state("networkidle")
+
+    target = datetime.strptime(date_str, "%Y-%m-%d")
+
+    # Jump the calendar to the requested date. Most calendar widgets expose a date-picker
+    # or "Go to date" control near the top -- click the visible day number as a fallback.
+    day_cell = page.get_by_text(str(target.day), exact=True).first
+    if day_cell.count() > 0:
+        day_cell.click()
+        page.wait_for_timeout(800)
+
+    # Collect the time labels of existing appointment blocks on the visible calendar.
+    booked_texts = page.locator("[class*='appointment'], [class*='event']").all_inner_texts()
+    booked_hours = set()
+    for text in booked_texts:
+        match = re.search(r"(\d{1,2}):(\d{2})\s*([AP]M)", text, re.I)
+        if match:
+            hour = int(match.group(1)) % 12
+            if match.group(3).upper() == "PM":
+                hour += 12
+            booked_hours.add(hour)
+
+    weekday = target.weekday()
+    if weekday not in BUSINESS_HOURS:
+        return []  # closed that day
+
+    open_hour, close_hour = BUSINESS_HOURS[weekday]
+    open_slots = []
+    for hour in range(open_hour, close_hour):
+        if hour not in booked_hours:
+            suffix = "AM" if hour < 12 else "PM"
+            display_hour = hour if hour <= 12 else hour - 12
+            display_hour = 12 if display_hour == 0 else display_hour
+            open_slots.append(f"{display_hour}:00 {suffix}")
+
+    return open_slots
+
+
 # --------------------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------------------
@@ -280,26 +339,15 @@ def check_availability():
     if not date_str:
         return jsonify({"error": "date is required"}), 400
 
+    if not (SMARTSCHEDULING_EMAIL and SMARTSCHEDULING_PASSWORD):
+        return jsonify({"error": "SmartScheduling credentials not configured"}), 500
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
         try:
-            login(page)
-            page.goto(GOCHECKIN_URL)
-            page.wait_for_load_state("networkidle")
-
-            # Read the calendar grid for the requested date and collect free 30-min slots
-            # per staff column. This depends on GoCheckIn's DOM structure -- inspect the
-            # calendar in devtools and adjust the selector below if it doesn't match.
-            booked_blocks = page.locator("[class*='appointment'], [class*='event']").all_inner_texts()
-
-            # NOTE: this is a starting point, not a finished slot calculator. A simple and
-            # reliable alternative: return the salon's normal business hours in 30-minute
-            # increments minus any time ranges you can parse out of booked_blocks, and let
-            # the agent double check available slots verbally against Retell's own logic,
-            # or just always offer 3 slots (e.g. next opening, +2h, +4h) and let
-            # book_appointment fail gracefully with a clear message if the slot is taken.
-            open_slots = ["10:00 AM", "1:00 PM", "4:00 PM"]  # placeholder until wired up
+            login_smartscheduling(page)
+            open_slots = read_smartscheduling_availability(page, date_str)
 
             return jsonify({
                 "date": date_str,
