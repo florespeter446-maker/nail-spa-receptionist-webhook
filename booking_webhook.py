@@ -6,9 +6,13 @@ Exposes three endpoints that a Retell custom function calls during a live phone 
   POST /book_appointment
   POST /take_message
 
-check_availability and book_appointment drive a real Chromium browser (via Playwright)
-through go-booking.gocheckin.net, because GoCheckIn has no public API. take_message just
-sends a notification (fill in your own SMS/email provider) -- no browser automation needed.
+check_availability and book_appointment drive two real Chromium browser sessions (via
+Playwright): one against go-booking.gocheckin.net (the real booking system customers are
+scheduled into) and, after a successful GoCheckIn booking, a second one against
+smartscheduling.com/calendar to mirror the same appointment there. Neither platform has a
+public API, so both are automated by clicking through the same screens a staff member would
+use. take_message just sends a notification (fill in your own SMS/email provider) -- no
+browser automation needed there.
 
 --------------------------------------------------------------------------------------
 SETUP
@@ -18,12 +22,14 @@ SETUP
 3. Set environment variables:
      GOCHECKIN_EMAIL=you@example.com
      GOCHECKIN_PASSWORD=your-password
-4. Fill in the two TODOs inside login() below -- see the comment there for how to find
-   the correct selectors. I could not capture these myself because the browser session
-   I inspected was already logged in.
+     SMARTSCHEDULING_EMAIL=you@example.com
+     SMARTSCHEDULING_PASSWORD=your-password
+4. Fill in the TODOs inside login() and login_smartscheduling() below -- see the comments
+   for how to find the correct selectors. I could not capture these myself because the
+   browser sessions I inspected were already logged in.
 5. Run locally to test:  python booking_webhook.py
    Then deploy somewhere reachable from the internet (Render / Railway / Fly.io / a VPS)
-   and point the function URLs in retell_functions.json at that deployment.
+   and point the function URLs in Retell at that deployment.
 --------------------------------------------------------------------------------------
 """
 
@@ -38,8 +44,20 @@ GOCHECKIN_URL = "https://go-booking.gocheckin.net/"
 GOCHECKIN_EMAIL = os.environ.get("GOCHECKIN_EMAIL")
 GOCHECKIN_PASSWORD = os.environ.get("GOCHECKIN_PASSWORD")
 
+SMARTSCHEDULING_URL = "https://smartscheduling.com/calendar"
+SMARTSCHEDULING_LOGIN_URL = "https://smartscheduling.com/en/account/login"
+SMARTSCHEDULING_EMAIL = os.environ.get("SMARTSCHEDULING_EMAIL")
+SMARTSCHEDULING_PASSWORD = os.environ.get("SMARTSCHEDULING_PASSWORD")
+
+DEFAULT_DURATION_MINUTES = 60
+DEFAULT_STAFF = "any"
+
 app = Flask(__name__)
 
+
+# --------------------------------------------------------------------------------------
+# GoCheckIn (go-booking.gocheckin.net) -- the real system customers are booked into
+# --------------------------------------------------------------------------------------
 
 def login(page):
     """
@@ -66,7 +84,6 @@ def login(page):
 
 def open_new_appointment_modal(page, date_str):
     """Navigate the calendar to the requested date and open the New Appointment modal."""
-    # Use the datepicker input at the top of the calendar to jump to the requested date.
     page.get_by_role("button", name="New").click()
     page.wait_for_selector("text=New Appointment")
 
@@ -111,12 +128,154 @@ def fill_appointment_details(page, start_time, duration_minutes, staff, service)
         suggestion.click()
 
 
+def book_on_gocheckin(data):
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            login(page)
+            page.goto(GOCHECKIN_URL)
+            page.wait_for_load_state("networkidle")
+
+            open_new_appointment_modal(page, data["date"])
+            find_or_create_client(page, data["client_name"], data["phone_number"])
+            fill_appointment_details(
+                page,
+                data["start_time"],
+                data["duration_minutes"],
+                data.get("staff", DEFAULT_STAFF),
+                data["service"],
+            )
+
+            if data.get("notes"):
+                page.get_by_placeholder("Appointment Note").fill(data["notes"])
+
+            page.get_by_role("button", name="Book").click()
+            page.wait_for_timeout(1500)
+
+            # TODO: check for a real success indicator (e.g. modal closing, a toast message)
+            # instead of just assuming success after the click.
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            browser.close()
+
+
+# --------------------------------------------------------------------------------------
+# SmartScheduling (smartscheduling.com/calendar) -- David's personal calendar view.
+# Its public online-booking widget is disabled, so this mirrors the same appointment
+# through the internal calendar the same way a staff member would create it.
+# --------------------------------------------------------------------------------------
+
+def login_smartscheduling(page):
+    """
+    Log into SmartScheduling. TODO before first run:
+    1. Open https://smartscheduling.com/en/account/login yourself in a normal browser
+       (logged out).
+    2. Right-click the email/username field -> Inspect. Note its selector.
+    3. Do the same for the password field and the submit/login button.
+    4. Replace the placeholder selectors below with the real ones.
+    """
+    page.goto(SMARTSCHEDULING_LOGIN_URL)
+    page.fill('input[type="email"], input[name="email"]', SMARTSCHEDULING_EMAIL)
+    page.fill('input[type="password"]', SMARTSCHEDULING_PASSWORD)
+    page.get_by_role("button", name=re.compile("log ?in", re.I)).click()
+    page.wait_for_load_state("networkidle")
+
+
+def create_smartscheduling_appointment(page, data):
+    """
+    Open the calendar, click any empty grid cell to open the "New Appointment" modal
+    (staff/date/time picked there are only approximate -- the modal's own fields are
+    used afterward to set the precise values), then fill in and save.
+    """
+    page.goto(SMARTSCHEDULING_URL)
+    page.wait_for_load_state("networkidle")
+
+    # Click into an empty area of the calendar grid to open the New Appointment modal.
+    # TODO: if this misses and hits an existing appointment block instead, adjust the
+    # coordinate or switch to a specific staff column first via the "All staff" dropdown.
+    page.mouse.click(700, 500)
+    page.wait_for_selector("text=Appointment", timeout=5000)
+
+    # Services: click "+" and select/search the matching service.
+    page.get_by_text("+", exact=True).first.click()
+    page.wait_for_timeout(500)
+    search = page.get_by_placeholder(re.compile("search", re.I))
+    if search.count() > 0:
+        search.first.fill(data["service"])
+        page.wait_for_timeout(500)
+        page.get_by_text(data["service"], exact=False).first.click()
+
+    # Staff member.
+    staff = data.get("staff", DEFAULT_STAFF)
+    if staff and staff.lower() != "any":
+        page.get_by_label("Staff Member").click()
+        page.get_by_text(staff, exact=False).click()
+
+    # Name / phone.
+    name_parts = data["client_name"].split(" ", 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+    page.get_by_label("First Name").fill(first_name)
+    if last_name:
+        page.get_by_label("Last Name").fill(last_name)
+    page.get_by_label("Phone").fill(data["phone_number"])
+
+    # Date.
+    target = datetime.strptime(data["date"], "%Y-%m-%d")
+    date_field = page.get_by_label("Date")
+    date_field.click()
+    # TODO: SmartScheduling's date picker widget wasn't captured in detail -- verify this
+    # opens a calendar you can click the right day in, and adjust as needed.
+    page.get_by_text(str(target.day), exact=True).first.click()
+
+    # Start / finish time.
+    page.get_by_label("Start").click()
+    page.get_by_text(data["start_time"], exact=False).first.click()
+    if data.get("finish_time"):
+        page.get_by_label("Finish").click()
+        page.get_by_text(data["finish_time"], exact=False).first.click()
+
+    if data.get("notes"):
+        page.get_by_label("Notes").fill(data["notes"])
+
+    page.get_by_role("button", name="Save").click()
+    page.wait_for_timeout(1500)
+
+
+def mirror_on_smartscheduling(data):
+    """Best-effort mirror -- failures here are logged but never fail the caller's booking,
+    since GoCheckIn is the system of record."""
+    if not (SMARTSCHEDULING_EMAIL and SMARTSCHEDULING_PASSWORD):
+        print("SmartScheduling mirror skipped: SMARTSCHEDULING_EMAIL/PASSWORD not set")
+        return {"attempted": False}
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            login_smartscheduling(page)
+            create_smartscheduling_appointment(page, data)
+            return {"attempted": True, "success": True}
+        except Exception as e:
+            print("SmartScheduling mirror failed:", e)
+            return {"attempted": True, "success": False, "error": str(e)}
+        finally:
+            browser.close()
+
+
+# --------------------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------------------
+
 @app.route("/check_availability", methods=["POST"])
 def check_availability():
     data = request.json or {}
     date_str = data.get("date")
     service = data.get("service")
-    staff_preference = data.get("staff_preference", "any")
+    staff_preference = data.get("staff_preference", DEFAULT_STAFF)
 
     if not date_str:
         return jsonify({"error": "date is required"}), 400
@@ -148,54 +307,38 @@ def check_availability():
                 "staff_preference": staff_preference,
                 "available_slots": open_slots,
             })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
         finally:
             browser.close()
 
 
 @app.route("/book_appointment", methods=["POST"])
 def book_appointment():
-    data = request.json or {}
-    required = ["client_name", "phone_number", "service", "staff", "date", "start_time", "duration_minutes"]
+    data = dict(request.json or {})
+
+    # Only these are truly essential -- everything else gets a sensible default so the
+    # agent doesn't fail a booking just because the conversation didn't explicitly collect
+    # a duration or a staff preference.
+    required = ["client_name", "phone_number", "service", "date", "start_time"]
     missing = [k for k in required if not data.get(k)]
     if missing:
         return jsonify({"success": False, "error": f"Missing fields: {', '.join(missing)}"}), 400
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        page = browser.new_page()
-        try:
-            login(page)
-            page.goto(GOCHECKIN_URL)
-            page.wait_for_load_state("networkidle")
+    data.setdefault("staff", DEFAULT_STAFF)
+    data.setdefault("duration_minutes", DEFAULT_DURATION_MINUTES)
 
-            open_new_appointment_modal(page, data["date"])
-            find_or_create_client(page, data["client_name"], data["phone_number"])
-            fill_appointment_details(
-                page,
-                data["start_time"],
-                data["duration_minutes"],
-                data.get("staff", "any"),
-                data["service"],
-            )
+    gocheckin_result = book_on_gocheckin(data)
+    if not gocheckin_result.get("success"):
+        return jsonify({"success": False, "error": gocheckin_result.get("error")}), 500
 
-            if data.get("notes"):
-                page.get_by_placeholder("Appointment Note").fill(data["notes"])
+    smartscheduling_result = mirror_on_smartscheduling(data)
 
-            page.get_by_role("button", name="Book").click()
-            page.wait_for_timeout(1500)
-
-            # TODO: check for a real success indicator (e.g. modal closing, a toast message)
-            # instead of just assuming success after the click.
-            success = True
-
-            # Notify David so he can mirror the booking on SmartScheduling if he wants to.
-            notify_owner(data)
-
-            return jsonify({"success": success, "confirmed": data})
-        except Exception as e:
-            return jsonify({"success": False, "error": str(e)}), 500
-        finally:
-            browser.close()
+    return jsonify({
+        "success": True,
+        "confirmed": data,
+        "smartscheduling": smartscheduling_result,
+    })
 
 
 @app.route("/take_message", methods=["POST"])
@@ -207,23 +350,5 @@ def take_message():
     return jsonify({"received": True})
 
 
-def notify_owner(booking):
-    """
-    TODO: send David a text or email with the booking details so he can manually
-    mirror it into smartscheduling.com/calendar if he's keeping that in sync.
-    Example with Twilio (after `pip install twilio` and setting TWILIO_* env vars):
-
-        from twilio.rest import Client
-        client = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_TOKEN"])
-        client.messages.create(
-            to="+19094470628",
-            from_=os.environ["TWILIO_FROM"],
-            body=f"New booking: {booking['client_name']} - {booking['service']} "
-                 f"on {booking['date']} at {booking['start_time']} with {booking['staff']}",
-        )
-    """
-    print("New booking to mirror on SmartScheduling if desired:", booking)
-
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
