@@ -181,10 +181,28 @@ def login_smartscheduling(page):
     4. Replace the placeholder selectors below with the real ones.
     """
     page.goto(SMARTSCHEDULING_LOGIN_URL)
-    page.fill('input[type="email"], input[name="email"]', SMARTSCHEDULING_EMAIL)
-    page.fill('input[type="password"]', SMARTSCHEDULING_PASSWORD)
-    page.get_by_role("button", name=re.compile("log ?in", re.I)).click()
+    page.fill('#UserName', SMARTSCHEDULING_EMAIL)
+    page.fill('#Password', SMARTSCHEDULING_PASSWORD)
+    page.get_by_role("button", name=re.compile("sign ?in", re.I)).click()
     page.wait_for_load_state("networkidle")
+
+
+def goto_smartscheduling_date(page, target):
+    """
+    SmartScheduling's calendar always loads on today's date. To view another day, click the
+    "Tue, 07/21/2026"-style button (id="display-current-date-button") in the top-left to open
+    a small month-grid date picker, then click the plain-text day-number cell for the target
+    date. No-op if the target date is already today (the default view).
+    """
+    today = datetime.now().date()
+    if target.date() == today:
+        return
+
+    page.click("#display-current-date-button")
+    page.wait_for_timeout(300)
+    day_cell = page.get_by_text(str(target.day), exact=True).first
+    day_cell.click()
+    page.wait_for_timeout(800)
 
 
 def create_smartscheduling_appointment(page, data):
@@ -195,6 +213,11 @@ def create_smartscheduling_appointment(page, data):
     """
     page.goto(SMARTSCHEDULING_URL)
     page.wait_for_load_state("networkidle")
+
+    # Navigate the calendar to the requested date BEFORE opening the modal, so whatever
+    # date the modal defaults to (today, or the grid cell clicked) is already correct.
+    target = datetime.strptime(data["date"], "%Y-%m-%d")
+    goto_smartscheduling_date(page, target)
 
     # Click into an empty area of the calendar grid to open the New Appointment modal.
     # TODO: if this misses and hits an existing appointment block instead, adjust the
@@ -225,14 +248,6 @@ def create_smartscheduling_appointment(page, data):
     if last_name:
         page.get_by_label("Last Name").fill(last_name)
     page.get_by_label("Phone").fill(data["phone_number"])
-
-    # Date.
-    target = datetime.strptime(data["date"], "%Y-%m-%d")
-    date_field = page.get_by_label("Date")
-    date_field.click()
-    # TODO: SmartScheduling's date picker widget wasn't captured in detail -- verify this
-    # opens a calendar you can click the right day in, and adjust as needed.
-    page.get_by_text(str(target.day), exact=True).first.click()
 
     # Start / finish time.
     page.get_by_label("Start").click()
@@ -277,37 +292,48 @@ BUSINESS_HOURS = {
 }
 
 
+def _time_to_hour(hour_str, minute_str, meridiem):
+    hour = int(hour_str) % 12
+    if meridiem.upper() == "PM":
+        hour += 12
+    return hour
+
+
 def read_smartscheduling_availability(page, date_str):
     """
     Navigate SmartScheduling's calendar to the requested date and read back which slots
     are already booked, so we can offer only genuinely open times.
 
-    TODO: verify the calendar's real date-navigation control and the DOM structure of
-    appointment blocks (never captured against a logged-out/empty day) -- adjust the
-    selectors below after watching one real check_availability call in the Render logs.
+    Since the salon books "anyone available" rather than a specific tech by default, an hour
+    only counts as fully booked once EVERY staff column has an overlapping appointment --
+    one busy tech shouldn't hide a slot that another tech could still take.
     """
     page.goto(SMARTSCHEDULING_URL)
     page.wait_for_load_state("networkidle")
 
     target = datetime.strptime(date_str, "%Y-%m-%d")
+    goto_smartscheduling_date(page, target)
 
-    # Jump the calendar to the requested date. Most calendar widgets expose a date-picker
-    # or "Go to date" control near the top -- click the visible day number as a fallback.
-    day_cell = page.get_by_text(str(target.day), exact=True).first
-    if day_cell.count() > 0:
-        day_cell.click()
-        page.wait_for_timeout(800)
+    staff_count = page.locator(".dhx_scale_bar").count() or 1
 
-    # Collect the time labels of existing appointment blocks on the visible calendar.
-    booked_texts = page.locator("[class*='appointment'], [class*='event']").all_inner_texts()
-    booked_hours = set()
+    # Collect the appointment blocks on the visible calendar. This is a DHTMLX Scheduler
+    # instance -- each appointment renders as a div.dhx_cal_event, with text like
+    # "10:00 am - 11:00 amRose with Chloe - Acrylic Fill S/M".
+    booked_texts = page.locator(".dhx_cal_event").all_inner_texts()
+    busy_count_by_hour = {}
+    time_range_re = re.compile(r"(\d{1,2}):(\d{2})\s*([AP]M)\s*-\s*(\d{1,2}):(\d{2})\s*([AP]M)", re.I)
     for text in booked_texts:
-        match = re.search(r"(\d{1,2}):(\d{2})\s*([AP]M)", text, re.I)
-        if match:
-            hour = int(match.group(1)) % 12
-            if match.group(3).upper() == "PM":
-                hour += 12
-            booked_hours.add(hour)
+        match = time_range_re.search(text)
+        if not match:
+            continue
+        start_hour = _time_to_hour(match.group(1), match.group(2), match.group(3))
+        end_hour = _time_to_hour(match.group(4), match.group(5), match.group(6))
+        # If the appointment ends exactly on the hour (e.g. ends at 11:00), that hour itself
+        # isn't occupied; otherwise round up so a partial-hour appointment still blocks it.
+        end_minute = int(match.group(5))
+        last_hour = end_hour if end_minute == 0 else end_hour + 1
+        for hour in range(start_hour, last_hour):
+            busy_count_by_hour[hour] = busy_count_by_hour.get(hour, 0) + 1
 
     weekday = target.weekday()
     if weekday not in BUSINESS_HOURS:
@@ -316,7 +342,7 @@ def read_smartscheduling_availability(page, date_str):
     open_hour, close_hour = BUSINESS_HOURS[weekday]
     open_slots = []
     for hour in range(open_hour, close_hour):
-        if hour not in booked_hours:
+        if busy_count_by_hour.get(hour, 0) < staff_count:
             suffix = "AM" if hour < 12 else "PM"
             display_hour = hour if hour <= 12 else hour - 12
             display_hour = 12 if display_hour == 0 else display_hour
