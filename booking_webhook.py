@@ -185,6 +185,7 @@ def login_smartscheduling(page):
     page.fill('#Password', SMARTSCHEDULING_PASSWORD)
     page.get_by_role("button", name=re.compile("sign ?in", re.I)).click()
     page.wait_for_load_state("networkidle")
+    print(f"[smartscheduling] after login, landed on: {page.url}")
 
 
 def goto_smartscheduling_date(page, target):
@@ -195,6 +196,7 @@ def goto_smartscheduling_date(page, target):
     date. No-op if the target date is already today (the default view).
     """
     today = datetime.now().date()
+    print(f"[smartscheduling] goto_date: target={target.date()} server_today={today} url={page.url}")
     if target.date() == today:
         return
 
@@ -382,7 +384,14 @@ def check_availability():
                 "available_slots": open_slots,
             })
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            # Debug info to see where the browser actually ended up when it failed --
+            # this is temporary while we're diagnosing live test failures.
+            debug = {}
+            try:
+                debug = {"page_url": page.url, "page_title": page.title()}
+            except Exception:
+                pass
+            return jsonify({"error": str(e), "debug": debug}), 500
         finally:
             browser.close()
 
